@@ -8,5 +8,6 @@ anyhow = "1"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 ratatui = "0.29"
+rig-core = "0.32"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
