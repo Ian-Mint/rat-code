@@ -5,6 +5,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::mpsc,
+    task,
 };
 
 #[derive(Debug, Clone)]
@@ -19,9 +20,9 @@ pub enum ClaudeEvent {
 pub fn spawn(prompt: String, tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut child = match Command::new("claude")
-            .args(["-p", &prompt, "--output-format", "stream-json"])
+            .args(["-p", &prompt, "--output-format", "stream-json", "--verbose"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(c) => c,
@@ -34,7 +35,23 @@ pub fn spawn(prompt: String, tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task
         };
 
         let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        // Drain stderr in a separate task to prevent pipe-buffer deadlock.
+        let stderr_task = task::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut buf = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(&line);
+            }
+            buf
+        });
+
         let mut lines = BufReader::new(stdout).lines();
+        let mut sent_done = false;
 
         'outer: while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
@@ -44,12 +61,23 @@ pub fn spawn(prompt: String, tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task
                 let done = matches!(event, ClaudeEvent::MessageStop);
                 let _ = tx.send(AppEvent::Claude(event));
                 if done {
+                    sent_done = true;
                     break 'outer;
                 }
             }
         }
 
         let _ = child.wait().await;
+
+        if !sent_done {
+            let stderr_output = stderr_task.await.unwrap_or_default();
+            let msg = if stderr_output.is_empty() {
+                "claude exited without a response".to_string()
+            } else {
+                stderr_output
+            };
+            let _ = tx.send(AppEvent::ClaudeError(msg));
+        }
     })
 }
 
@@ -125,6 +153,24 @@ mod tests {
     fn system_init_event_ignored() {
         let line = r#"{"type":"system","subtype":"init","session_id":"x","tools":[]}"#;
         assert!(parse_line(line).is_empty());
+    }
+
+    #[test]
+    fn error_output_and_empty_stdout_produces_no_message_stop() {
+        // Reproduces the "nested session" hang: the claude binary writes an error
+        // to stderr, produces no stdout, so parse_line is never called and
+        // MessageStop is never emitted. sent_done stays false → ClaudeError fired.
+        let lines: &[&str] = &[
+            r#"{"type":"system","subtype":"init"}"#, // a system line but no result
+        ];
+        let has_stop = lines
+            .iter()
+            .flat_map(|l| parse_line(l))
+            .any(|e| matches!(e, ClaudeEvent::MessageStop));
+        assert!(
+            !has_stop,
+            "no MessageStop should come from a truncated stream"
+        );
     }
 
     #[test]
