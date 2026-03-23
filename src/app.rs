@@ -76,6 +76,7 @@ pub struct App {
 
     pending_tool: Option<ToolRequest>,
     pub current_tool: Option<ToolRequest>, // visible to ui during AwaitingApproval
+    buffered_claude_events: Vec<ClaudeEvent>, // events arriving during AwaitingApproval
     claude_task: Option<JoinHandle<()>>,
 }
 
@@ -89,6 +90,7 @@ impl App {
             should_quit: false,
             pending_tool: None,
             current_tool: None,
+            buffered_claude_events: Vec::new(),
             claude_task: None,
         }
     }
@@ -173,12 +175,16 @@ impl App {
                         .push(Message::tool(tool.name, tool.input, true));
                 }
                 self.mode = Mode::Responding;
+                for event in std::mem::take(&mut self.buffered_claude_events) {
+                    self.handle_claude(event);
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 if let Some(tool) = self.current_tool.take() {
                     self.messages
                         .push(Message::tool(tool.name, tool.input, false));
                 }
+                self.buffered_claude_events.clear();
                 self.abort_claude();
                 self.mode = Mode::Input;
             }
@@ -187,8 +193,9 @@ impl App {
     }
 
     fn handle_claude(&mut self, event: ClaudeEvent) {
-        // Buffer events during approval; they'll be processed when mode returns to Responding
+        // Buffer events during approval; replay them when mode returns to Responding
         if self.mode == Mode::AwaitingApproval {
+            self.buffered_claude_events.push(event);
             return;
         }
 
@@ -245,5 +252,102 @@ impl App {
 
     fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    fn key_event(code: KeyCode) -> AppEvent {
+        AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Reproduces the hang: events arriving during AwaitingApproval were silently
+    /// dropped, so MessageStop was never processed and the app stayed in Responding.
+    #[test]
+    fn buffered_events_replayed_on_approval() {
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new();
+        app.mode = Mode::Responding;
+
+        // Tool call sequence → transitions to AwaitingApproval
+        app.handle_event(
+            AppEvent::Claude(ClaudeEvent::ToolUseStart {
+                name: "shell".to_string(),
+            }),
+            &tx,
+        );
+        app.handle_event(
+            AppEvent::Claude(ClaudeEvent::ToolInputDelta(
+                r#"{"command":"echo $SHELL"}"#.to_string(),
+            )),
+            &tx,
+        );
+        app.handle_event(AppEvent::Claude(ClaudeEvent::ToolUseStop), &tx);
+        assert_eq!(app.mode, Mode::AwaitingApproval);
+
+        // Follow-up events arrive while waiting for approval (previously dropped).
+        app.handle_event(
+            AppEvent::Claude(ClaudeEvent::TextDelta("/bin/fish\n".to_string())),
+            &tx,
+        );
+        app.handle_event(AppEvent::Claude(ClaudeEvent::MessageStop), &tx);
+
+        // Still waiting — buffered, not yet processed.
+        assert_eq!(app.mode, Mode::AwaitingApproval);
+
+        // User approves → buffered events should replay.
+        app.handle_event(key_event(KeyCode::Char('y')), &tx);
+
+        // MessageStop replayed: mode must be Input, not stuck in Responding.
+        assert_eq!(
+            app.mode,
+            Mode::Input,
+            "app should reach Input after buffered MessageStop replays on approval"
+        );
+
+        // TextDelta replayed: assistant message should contain the tool output.
+        let has_response = app
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, Role::Assistant) && m.content.contains("/bin/fish"));
+        assert!(
+            has_response,
+            "assistant response from buffered TextDelta should appear"
+        );
+    }
+
+    /// Rejecting a tool use clears the buffer and aborts cleanly.
+    #[test]
+    fn buffered_events_cleared_on_rejection() {
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut app = App::new();
+        app.mode = Mode::Responding;
+
+        app.handle_event(
+            AppEvent::Claude(ClaudeEvent::ToolUseStart {
+                name: "shell".to_string(),
+            }),
+            &tx,
+        );
+        app.handle_event(
+            AppEvent::Claude(ClaudeEvent::ToolInputDelta("{}".to_string())),
+            &tx,
+        );
+        app.handle_event(AppEvent::Claude(ClaudeEvent::ToolUseStop), &tx);
+        app.handle_event(
+            AppEvent::Claude(ClaudeEvent::TextDelta("output".to_string())),
+            &tx,
+        );
+        app.handle_event(AppEvent::Claude(ClaudeEvent::MessageStop), &tx);
+        assert_eq!(app.mode, Mode::AwaitingApproval);
+
+        app.handle_event(key_event(KeyCode::Char('n')), &tx);
+
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.buffered_claude_events.is_empty());
     }
 }
