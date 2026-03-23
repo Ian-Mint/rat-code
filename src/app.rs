@@ -73,6 +73,7 @@ pub struct App {
     pub input: String,
     pub scroll_offset: u16, // lines scrolled up from bottom; 0 = pinned to bottom
     pub should_quit: bool,
+    pub pending_quit: bool, // true after first ctrl+c/ctrl+d; second press exits
 
     pending_tool: Option<ToolRequest>,
     pub current_tool: Option<ToolRequest>, // visible to ui during AwaitingApproval
@@ -88,6 +89,7 @@ impl App {
             input: String::new(),
             scroll_offset: 0,
             should_quit: false,
+            pending_quit: false,
             pending_tool: None,
             current_tool: None,
             buffered_claude_events: Vec::new(),
@@ -113,12 +115,20 @@ impl App {
         key: crossterm::event::KeyEvent,
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) {
-        // Ctrl-C always quits
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.abort_claude();
-            self.should_quit = true;
+        let is_quit_key = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'));
+
+        if is_quit_key {
+            if self.pending_quit {
+                self.abort_claude();
+                self.should_quit = true;
+            } else {
+                self.pending_quit = true;
+            }
             return;
         }
+
+        self.pending_quit = false;
 
         match self.mode {
             Mode::Input => self.handle_key_input(key, tx),
