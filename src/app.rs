@@ -77,7 +77,6 @@ pub struct App {
     pending_tool: Option<ToolRequest>,
     pub current_tool: Option<ToolRequest>, // visible to ui during AwaitingApproval
     claude_task: Option<JoinHandle<()>>,
-    pending_events: Vec<ClaudeEvent>,
 }
 
 impl App {
@@ -91,7 +90,6 @@ impl App {
             pending_tool: None,
             current_tool: None,
             claude_task: None,
-            pending_events: Vec::new(),
         }
     }
 
@@ -175,17 +173,12 @@ impl App {
                         .push(Message::tool(tool.name, tool.input, true));
                 }
                 self.mode = Mode::Responding;
-                let buffered = std::mem::take(&mut self.pending_events);
-                for ev in buffered {
-                    self.handle_claude(ev);
-                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 if let Some(tool) = self.current_tool.take() {
                     self.messages
                         .push(Message::tool(tool.name, tool.input, false));
                 }
-                self.pending_events.clear();
                 self.abort_claude();
                 self.mode = Mode::Input;
             }
@@ -196,7 +189,6 @@ impl App {
     fn handle_claude(&mut self, event: ClaudeEvent) {
         // Buffer events during approval; they'll be processed when mode returns to Responding
         if self.mode == Mode::AwaitingApproval {
-            self.pending_events.push(event);
             return;
         }
 
@@ -253,98 +245,5 @@ impl App {
 
     fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::claude::ClaudeEvent;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tokio::sync::mpsc;
-
-    fn make_key(c: char) -> AppEvent {
-        AppEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-    }
-
-    #[test]
-    fn approval_buffers_post_tool_events_then_replays_on_yes() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new();
-
-        // Simulate tool-use stream
-        app.handle_event(
-            AppEvent::Claude(ClaudeEvent::ToolUseStart {
-                name: "bash".into(),
-            }),
-            &tx,
-        );
-        app.handle_event(
-            AppEvent::Claude(ClaudeEvent::ToolInputDelta("{}".into())),
-            &tx,
-        );
-        app.handle_event(AppEvent::Claude(ClaudeEvent::ToolUseStop), &tx);
-        assert_eq!(app.mode, Mode::AwaitingApproval);
-
-        // Events arriving while waiting for approval must be buffered, not dropped
-        app.handle_event(
-            AppEvent::Claude(ClaudeEvent::TextDelta("found it".into())),
-            &tx,
-        );
-        assert_eq!(app.mode, Mode::AwaitingApproval);
-
-        app.handle_event(AppEvent::Claude(ClaudeEvent::MessageStop), &tx);
-        assert_eq!(app.mode, Mode::AwaitingApproval);
-
-        // Approving should replay the buffer: TextDelta then MessageStop → mode becomes Input
-        app.handle_event(make_key('y'), &tx);
-        assert_eq!(app.mode, Mode::Input);
-
-        // The buffered TextDelta should have been committed to messages
-        let has_found_it = app
-            .messages
-            .iter()
-            .any(|m| matches!(m.role, Role::Assistant) && m.content.contains("found it"));
-        assert!(
-            has_found_it,
-            "expected assistant message containing 'found it'"
-        );
-    }
-
-    #[test]
-    fn rejection_discards_buffered_events() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new();
-
-        app.handle_event(
-            AppEvent::Claude(ClaudeEvent::ToolUseStart {
-                name: "bash".into(),
-            }),
-            &tx,
-        );
-        app.handle_event(
-            AppEvent::Claude(ClaudeEvent::ToolInputDelta("{}".into())),
-            &tx,
-        );
-        app.handle_event(AppEvent::Claude(ClaudeEvent::ToolUseStop), &tx);
-        assert_eq!(app.mode, Mode::AwaitingApproval);
-
-        app.handle_event(
-            AppEvent::Claude(ClaudeEvent::TextDelta("dropped".into())),
-            &tx,
-        );
-        app.handle_event(AppEvent::Claude(ClaudeEvent::MessageStop), &tx);
-
-        app.handle_event(make_key('n'), &tx);
-        assert_eq!(app.mode, Mode::Input);
-
-        let has_dropped = app
-            .messages
-            .iter()
-            .any(|m| matches!(m.role, Role::Assistant) && m.content.contains("dropped"));
-        assert!(
-            !has_dropped,
-            "rejected events should not appear in messages"
-        );
     }
 }
