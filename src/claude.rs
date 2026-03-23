@@ -2,11 +2,14 @@ use crate::app::AppEvent;
 use futures::StreamExt;
 use rig::agent::MultiTurnStreamItem;
 use rig::client::CompletionClient;
+use rig::completion::ToolDefinition;
 use rig::providers::anthropic;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig::tool::Tool;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
-const MODEL: &str = "claude-sonnet-4-5-20251001";
+const MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone)]
 pub enum ClaudeEvent {
@@ -15,6 +18,74 @@ pub enum ClaudeEvent {
     ToolInputDelta(String),
     ToolUseStop,
     MessageStop,
+}
+
+#[derive(Deserialize)]
+struct ShellArgs {
+    command: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("shell error: {0}")]
+struct ShellError(String);
+
+struct Shell {
+    shell: String,
+}
+
+impl Shell {
+    fn new() -> Self {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        Self { shell }
+    }
+}
+
+impl Tool for Shell {
+    const NAME: &'static str = "shell";
+
+    type Error = ShellError;
+    type Args = ShellArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: "shell".to_string(),
+            description:
+                "Execute a shell command and return its output (stdout and stderr combined)."
+                    .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute."
+                    }
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let output = tokio::process::Command::new(&self.shell)
+            .arg("-c")
+            .arg(&args.command)
+            .output()
+            .await
+            .map_err(|e| ShellError(e.to_string()))?;
+
+        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            result.push_str(&stderr);
+        }
+        if !output.status.success()
+            && let Some(code) = output.status.code()
+        {
+            result.push_str(&format!("\n[exit code: {code}]"));
+        }
+        Ok(result)
+    }
 }
 
 pub fn spawn(prompt: String, tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task::JoinHandle<()> {
@@ -36,7 +107,11 @@ pub fn spawn(prompt: String, tx: mpsc::UnboundedSender<AppEvent>) -> tokio::task
                 return;
             }
         };
-        let agent = client.agent(MODEL).max_tokens(8096).build();
+        let agent = client
+            .agent(MODEL)
+            .max_tokens(8096)
+            .tool(Shell::new())
+            .build();
 
         let mut stream = agent.stream_prompt(&prompt).await;
 
